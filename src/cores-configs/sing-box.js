@@ -355,7 +355,7 @@ function buildSingBoxVLESSOutbound(proxySettings, remark, address, port, host, s
             server_name: sni,
             utls: {
                 enabled: true,
-                fingerprint: "randomized"
+                fingerprint: "chrome"
             }
         },
         transport: {
@@ -396,7 +396,7 @@ function buildSingBoxTrojanOutbound(proxySettings, remark, address, port, host, 
             server_name: sni,
             utls: {
                 enabled: true,
-                fingerprint: "randomized"
+                fingerprint: "chrome"
             }
         },
         transport: {
@@ -458,7 +458,7 @@ function buildSingBoxChainOutbound(chainProxyParams, enableIPv6) {
             insecure: false,
             utls: {
                 enabled: true,
-                fingerprint: fp
+                fingerprint: "chrome"
             }
         };
 
