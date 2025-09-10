@@ -14,7 +14,7 @@ async function generateJWTToken(request, env) {
     const jwtToken = await new SignJWT({ userID: globalThis.userID })
         .setProtectedHeader({ alg: 'HS256' })
         .setIssuedAt()
-        .setExpirationTime('7d')
+        .setExpirationTime('24h')
         .sign(secret);
 
     return new Response('Success', {
@@ -57,7 +57,7 @@ export function logout() {
     return new Response('Success', {
         status: 200,
         headers: {
-            'Set-Cookie': 'jwtToken=; Path=/; Secure; SameSite=None; Expires=Thu, 01 Jan 1970 00:00:00 GMT',
+            'Set-Cookie': 'jwtToken=; Secure; SameSite=None; Expires=Thu, 01 Jan 1970 00:00:00 GMT',
             'Content-Type': 'text/plain'
         }
     });

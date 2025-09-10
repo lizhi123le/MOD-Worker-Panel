@@ -1,10 +1,10 @@
-import { isDomain } from '../helpers/helpers';
+import { resolveDNS, isDomain } from '../helpers/helpers';
 
 const MAX_IPS_TO_PICK = 8;
 
 export async function getConfigAddresses(cleanIPs, enableIPv6) {
     const ips = cleanIPs ? cleanIPs.split(',') : [];
-
+    
     // Group IPs by first two octets
     const ipGroups = {};
     ips.forEach(ip => {
@@ -21,9 +21,9 @@ export async function getConfigAddresses(cleanIPs, enableIPv6) {
     // Get unique group keys and shuffle them
     const groupKeys = Object.keys(ipGroups);
     const shuffledGroups = groupKeys.sort(() => Math.random() - 0.5);
-
+    
     let selectedIPs = [];
-
+    
     // Try to get one IP from each group first (up to MAX_IPS_TO_PICK)
     shuffledGroups.slice(0, MAX_IPS_TO_PICK).forEach(groupKey => {
         const groupIPs = ipGroups[groupKey];
@@ -41,7 +41,22 @@ export async function getConfigAddresses(cleanIPs, enableIPv6) {
         selectedIPs = [...selectedIPs, ...additionalIPs];
     }
 
-    return selectedIPs;
+    return [
+        'www.vimeo.com',
+        'www.speedtest.net',
+        ...selectedIPs
+    ];
+}
+
+export function extractWireguardParams(warpConfigs, isWoW) {
+    const index = isWoW ? 1 : 0;
+    const warpConfig = warpConfigs[index].account.config;
+    return {
+        warpIPv6: `${warpConfig.interface.addresses.v6}/128`,
+        reserved: warpConfig.client_id,
+        publicKey: warpConfig.peers[0].public_key,
+        privateKey: warpConfigs[index].privateKey,
+    };
 }
 
 export function generateRemark(index, port, address, cleanIPs, protocol, configType) {
@@ -71,6 +86,13 @@ export function getRandomPath(length) {
         result += characters.charAt(Math.floor(Math.random() * charactersLength));
     }
     return result;
+}
+
+export function base64ToDecimal(base64) {
+    const binaryString = atob(base64);
+    const hexString = Array.from(binaryString).map(char => char.charCodeAt(0).toString(16).padStart(2, '0')).join('');
+    const decimalArray = hexString.match(/.{2}/g).map(hex => parseInt(hex, 16));
+    return decimalArray;
 }
 
 export function isIPv4(address) {

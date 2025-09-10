@@ -1,16 +1,13 @@
 import { initializeParams } from './helpers/init';
-import { initializeMockDb } from './helpers/mockDb';
 import { vlessOverWSHandler } from './protocols/vless';
 import { trojanOverWSHandler } from './protocols/trojan';
 import { logout, resetPassword, login } from './authentication/auth';
 import { renderErrorPage } from './pages/error';
+import { getXrayCustomConfigs } from './cores-configs/xray';
 import { getSingBoxCustomConfig } from './cores-configs/sing-box';
+import { getClashNormalConfig } from './cores-configs/clash';
+import { getNormalConfigs } from './cores-configs/normalConfigs';
 import { getMyIP, handlePanel } from './helpers/helpers';
-
-// Forbid Russian colos so it picks proper EU one
-export const NETWORK = Object.freeze({
-    FORBIDDEN_COLOS: ["DME", "LED", "SVX", "KJA"],
-});
 
 export default {
     async fetch(request, env) {
@@ -20,31 +17,24 @@ export default {
 
             // Prioritize vless/trojan proxy requests
             if (upgradeHeader === 'websocket') {
-                const colo = request.cf?.colo;
-                if (colo && NETWORK.FORBIDDEN_COLOS.includes(colo)) {
-                    return new Response(`Bad Cloudflare colo: ${colo}. Try again with another clean IP.`, {
-                        status: 403,
-                        headers: { 'Content-Type': 'text/plain' },
-                    });
-                }
-                else {
-                    return globalThis.pathName.startsWith('/tr')
-                        ? await trojanOverWSHandler(request)
-                        : await vlessOverWSHandler(request);
-                }
+                return globalThis.pathName.startsWith('/tr')
+                    ? await trojanOverWSHandler(request)
+                    : await vlessOverWSHandler(request);
             }
-
-            // Force proper region for CF worker via D1 trick
-            await initializeMockDb(env.MOCK_DB);
 
             // Handle other paths
             switch (globalThis.pathName) {
 
                 case `/sub/${globalThis.userID}`:
-                    return await getSingBoxCustomConfig(request, env, false);
+                    if (globalThis.client === 'sfa') return await getSingBoxCustomConfig(request, env, false);
+                    if (globalThis.client === 'clash') return await getClashNormalConfig(request, env);
+                    if (globalThis.client === 'xray') return await getXrayCustomConfigs(request, env, false);
+                    return await getNormalConfigs(request, env);
 
                 case `/fragsub/${globalThis.userID}`:
-                    return await getSingBoxCustomConfig(request, env, true);
+                    return globalThis.client === 'hiddify'
+                        ? await getSingBoxCustomConfig(request, env, true)
+                        : await getXrayCustomConfigs(request, env, true);
 
                 case '/panel':
                     return await handlePanel(request, env);

@@ -1,4 +1,4 @@
-import { getConfigAddresses, generateRemark, randomUpperCase, getRandomPath, isIPv6 } from './helpers';
+import { getConfigAddresses, extractWireguardParams, generateRemark, randomUpperCase, getRandomPath, isIPv6 } from './helpers';
 import { getDataset } from '../kv/handlers';
 import { isDomain } from '../helpers/helpers';
 
@@ -350,12 +350,13 @@ function buildSingBoxVLESSOutbound(proxySettings, remark, address, port, host, s
         domain_strategy: enableIPv6 ? "prefer_ipv4" : "ipv4_only",
         uuid: globalThis.userID,
         tls: {
+            alpn: "h3,h2",
             enabled: true,
             insecure: allowInsecure,
             server_name: sni,
             utls: {
                 enabled: true,
-                fingerprint: "chrome"
+                fingerprint: "randomized"
             }
         },
         transport: {
@@ -391,12 +392,13 @@ function buildSingBoxTrojanOutbound(proxySettings, remark, address, port, host, 
         server_port: +port,
         domain_strategy: enableIPv6 ? "prefer_ipv4" : "ipv4_only",
         tls: {
+            alpn: "h3,h2",
             enabled: true,
             insecure: allowInsecure,
             server_name: sni,
             utls: {
                 enabled: true,
-                fingerprint: "chrome"
+                fingerprint: "randomized"
             }
         },
         transport: {
@@ -452,13 +454,15 @@ function buildSingBoxChainOutbound(chainProxyParams, enableIPv6) {
     };
 
     if (security === 'tls' || security === 'reality') {
+        const tlsAlpns = alpn ? alpn?.split(',').filter(value => value !== 'h2') : [];
         chainOutbound.tls = {
             enabled: true,
             server_name: sni,
             insecure: false,
+            alpn: tlsAlpns,
             utls: {
                 enabled: true,
-                fingerprint: "chrome"
+                fingerprint: fp
             }
         };
 
@@ -678,7 +682,7 @@ const singboxConfigTemp = {
             type: "urltest",
             tag: "",
             outbounds: [],
-            url: "https://gist.githubusercontent.com/vadash/0fe70c9644ce9104995e8b148fb1ca11/raw/5f40b219b3418294308e79dea70d7ce284c2e715/ping_512KB.bin",
+            url: "https://pastebin.com/raw/E3xeXQmT",
             interval: ""
         },
         {
