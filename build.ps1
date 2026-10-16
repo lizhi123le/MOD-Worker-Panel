@@ -13,10 +13,21 @@
 #   -> smoke.mjs      (behaviour must equal the pre-obfuscation build)
 #   -> 7z
 #
-# Tuning knobs are environment variables read by obfuscate.mjs:
-#   HARDEN_STRINGS (true) HARDEN_OPAQUE (0.2) HARDEN_CFF (0.05)
-#   HARDEN_INTEGRITY (true) HARDEN_ANTIDEBUG (false) HARDEN_SELFDEFENDING (false)
+# Tuning knobs are environment variables read by obfuscate.mjs. These are the
+# real defaults (see CONFIG in obfuscate.mjs). HARDEN_CFF must stay 0: js-confuser
+# control-flow flattening emits `with`, which is illegal in an ES module.
+#   HARDEN_STRINGS (true) HARDEN_OPAQUE (0.2) HARDEN_CFF (0)
+#   HARDEN_INTEGRITY (false) HARDEN_ANTIDEBUG (false) HARDEN_SELFDEFENDING (false)
 # ==================================================================
+
+# Always build from the repository root. Every path in this script (.\output,
+# node_modules, tools\, sensitive_words_auto.txt) is relative to the repository,
+# so launching it from any other working directory - right-click "Run with
+# PowerShell", an IDE task, a shortcut - used to die instantly on
+# tools/cipher.test.mjs before printing anything useful.
+if ($PSScriptRoot) {
+    Set-Location -LiteralPath $PSScriptRoot
+}
 
 # Constants
 $howManyToBuild = 20
@@ -43,6 +54,43 @@ function Ensure-OutputDirectory {
     if (!(Test-Path -Path $Path)) {
         New-Item -ItemType Directory -Path $Path | Out-Null
         Write-Status "Created output directory: $Path"
+    }
+}
+
+# Fails fast with an actionable message when the repository has never been
+# installed (or node_modules was cleaned). Without this the very first wrangler
+# call dies with a bare "Cannot find module ...\node_modules\wrangler\bin\
+# wrangler.js", which is what makes the script look like it simply quits.
+function Assert-Prerequisites {
+    $missing = @()
+
+    if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+        $missing += 'node - Node.js is not on PATH'
+    }
+
+    foreach ($relative in @(
+            'node_modules/wrangler/bin/wrangler.js',
+            'node_modules/uglify-js/bin/uglifyjs',
+            'node_modules/js-confuser',
+            'node_modules/@babel/parser')) {
+        if (!(Test-Path -LiteralPath $relative)) { $missing += $relative }
+    }
+
+    if ($missing.Count -gt 0) {
+        throw ("build prerequisites are missing:`n      " + ($missing -join "`n      ") +
+            "`n    Run 'npm install' in $PWD, then start this script again.")
+    }
+}
+
+# Keeps a failure on screen. `pause` returns immediately when stdin is not an
+# interactive console (npm run, a pipe, a redirected shell, DSH), which is how a
+# failed build could disappear before the error could be read.
+function Wait-BeforeExit {
+    try {
+        $null = Read-Host '按 Enter 键退出...'
+    }
+    catch {
+        Start-Sleep -Seconds 10
     }
 }
 
@@ -79,7 +127,7 @@ function Invoke-Uglify {
         "--compress", "drop_console=true",
         "--mangle",
         "-O", "keep_quoted_props"
-    ) -Label "uglify-js" | Out-Null
+    ) -Label "uglify-js"
     Write-Status "Minified '$Path' with uglify-js (drop_console, mangle)"
 }
 
@@ -91,7 +139,7 @@ function Invoke-WranglerBuild {
     try {
         Invoke-Checked -Command "node" -Arguments @(
             "node_modules/wrangler/bin/wrangler.js", "deploy", "--dry-run", "--outdir", "output"
-        ) -Label "wrangler dry-run" | Out-Null
+        ) -Label "wrangler dry-run"
         if (!(Test-Path ".\output\worker.js")) {
             throw "Wrangler build failed - no output file created"
         }
@@ -132,8 +180,9 @@ function Build-Worker {
 
 function Confirm-7ZipAvailable {
     if (!(Test-Path $sevenZipPath)) {
-        Write-Status "7-Zip not found at $sevenZipPath" -Level "ERROR"
-        exit 1
+        # throw, not exit: an exit here skipped the error handler entirely and
+        # closed the window with no message at all.
+        throw "7-Zip not found at $sevenZipPath - install it, or fix `$sevenZipPath at the top of this script"
     }
     Write-Status "7-Zip found at $sevenZipPath"
 }
@@ -157,7 +206,7 @@ function Compress-WorkerFile {
 
     Invoke-Checked -Command $sevenZipPath -Arguments @(
         "a", "-tzip", "-mx=0", "$OutputDir\$zipName", $Path
-    ) -Label "7-Zip" | Out-Null
+    ) -Label "7-Zip"
     Write-Status "Created compressed worker: $zipName"
 }
 
@@ -167,6 +216,10 @@ function Compress-WorkerFile {
 
 try {
     Confirm-7ZipAvailable
+    Assert-Prerequisites
+
+    # Only wipe the previous artifacts once every prerequisite is proven, so a
+    # preflight failure no longer destroys the zips you already have.
     Stop-7ZipProcesses
     Remove-Item -Recurse -Force -Path .\output\ -ErrorAction SilentlyContinue
 
@@ -212,7 +265,7 @@ try {
 }
 catch {
     Write-Status "Critical error in main execution: $_" -Level "ERROR"
-    pause
+    Wait-BeforeExit
     exit 1
 }
 
