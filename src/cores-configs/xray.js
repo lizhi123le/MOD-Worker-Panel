@@ -637,7 +637,7 @@ async function buildXrayWorkerLessConfig(proxySettings) {
     return config;
 }
 
-export async function getXrayCustomConfigs(request, env) {
+export async function getXrayCustomConfigs(request, env, isFragment) {
     const { proxySettings } = await getDataset(request, env);
     let configs = [];
     let outbounds = [];

@@ -4,8 +4,8 @@ A modified Cloudflare Worker Panel for **my** needs. You are welcome to use it.
 
 # ⭐ Key Features
 
-- 🔒 Optimized obfuscation that won't trigger Cloudflare AV and is light on CPU
-- 🚫 Automatic banned word detection in obfuscated code (vless, trojan, bpb)
+- 🔒 String + property-name obfuscation with a per-build ChaCha20 cipher, verified against the un-obfuscated build before every zip is written
+- 🚫 Automatic banned word detection that decrypts the payload and scans the cleartext (not just `grep` over the bundle)
 - 🌐 Smart CleanIP management with random selection (up to 10 IPs) from clean IP pool
 
 # 🚀 Configuration
@@ -97,6 +97,56 @@ if ($filteredIPs.Count -gt 0) {
     "" | Set-Clipboard  # Clear clipboard if no results
 }
 ```
+
+# 🔐 Build & Obfuscation
+
+`build.ps1` produces each worker like this:
+
+1. `wrangler deploy --dry-run` bundles `src/worker.js`;
+2. `uglify-js --compress drop_console=true --mangle` minifies it (AST-level work only - no regex is ever run over the source);
+3. a copy is kept as `output/_worker.reference.js`;
+4. `obfuscate.mjs` runs js-confuser and encrypts every string literal **and every property name** with **ChaCha20 (RFC 8439)**: one random 32-byte key per build, one random 8-byte nonce per string, payload carried as base64;
+5. `verify.mjs` proves that nothing was lost, that no banned word survives in the clear and that the artifact still parses and exports a handler;
+6. `smoke.mjs` drives both the obfuscated worker and the reference through 21 requests and requires byte-identical behaviour;
+7. only then is the zip written.
+
+## What this is, and what it is not
+
+- It defeats keyword scanning and string/property signature matching: the bundle contains no `vless`, `trojan` or `bpb`, no readable HTML/CSS/client script, and no readable property names.
+- It is **not confidentiality**. The ChaCha20 key ships inside `_worker.js`, so anyone who obtains the file can decode the payload. Treat the worker as public: keep `ID`, `PASS`, `HASH`, `PROXYIP` in environment variables/secrets and never put secrets in code.
+
+## Hardening knobs (environment variables)
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `HARDEN_STRINGS` | `true` | `false` = legacy mode: only strings containing `bpb`/`vless`/`trojan` are concealed (~40% smaller, but the panel's identity is readable) |
+| `HARDEN_OPAQUE` | `0.2` | opaque predicate probability |
+| `HARDEN_INTEGRITY` | `false` | per-function checksum lock. **Off by default**: js-confuser 2.0 generates its wrapper locals without checking the names `renameVariables` already handed out, so a build can shadow the hash function itself (`function dJ(){var aV=…aV(ba,9897108)}`) and make that function throw `TypeError` at runtime. It is a per-build lottery, so `verify.mjs` rejects the shape and the lock is opt-in |
+| `HARDEN_ANTIDEBUG` | `false` | `debugger;` injection - costs CPU, not recommended on the free plan |
+| `HARDEN_SELFDEFENDING` | `false` | breaks any code formatter |
+| `HARDEN_CFF` | `0` | **must stay 0**: js-confuser's control-flow flattening emits a `with` statement, which is a syntax error in an ES module. `obfuscate.mjs` refuses to build with it enabled |
+
+`HARDEN_INTEGRITY=true` hashes each top-level function through `Function.prototype.toString()` on first call. Two reasons it is off by default: the wrapper-local collision described above, and the fact that the check fires on any runtime that normalises the source text. `verify.mjs` rejects the collision shape statically, so if you enable the lock you will at least not ship that bug.
+
+`HARDEN_OPAQUE` is the cheap anti-analysis knob (it survives the ES-module constraint that rules out control-flow flattening). Raise it if you want more noise in the control flow; it costs a few bytes and no measurable CPU.
+
+## Gates
+
+```powershell
+node tools/cipher.test.mjs   # RFC 8439 test vector, round-trip, non-determinism
+node verify.mjs              # syntax, data-loss coverage, banned-word leak, runtime presence
+node verify.mjs <_worker.js> # audit a lone artifact (a downloaded zip): the key is recovered from the file itself
+node smoke.mjs               # behaviour parity against output/_worker.reference.js
+node smoke.mjs --bench       # ...plus cold/warm cost of the concealed-string path
+```
+
+A zip is only written when all gates pass, and every one of the 20 builds is verified individually with its own key.
+
+Measured overhead of the concealed-string path (Node wall clock, 400 warm `GET /login` requests): `+0.04 ms/request` warm and `+7 ms` on the very first request in an isolate, because js-confuser caches each decoded payload entry per index. That is far inside the free-plan 10 ms CPU budget.
+
+## Password storage
+
+`pwd` in KV holds `pbkdf2$<iterations>$<salt>$<hash>` (PBKDF2-SHA256, 25 000 iterations by default). The measured cost of one derivation with WebCrypto here is ~4.5 ms (10k ~3 ms, 100k ~18 ms), so the default fits the Workers free-plan 10 ms CPU budget; set the `PBKDF2_ITERATIONS` variable (e.g. `100000`) on a paid plan. Legacy plain-text values are verified and upgraded in place on the next successful login. Passwords must contain a capital letter, a number and be at least 8 characters - enforced on the server now, not only in the browser. Login is throttled to 5 failures per IP per 15 minutes (KV-backed, best effort).
 
 # 📝 Credits
 

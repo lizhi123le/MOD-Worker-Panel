@@ -1,16 +1,31 @@
 # ==================================================================
 # Script: build.ps1
-# Description: This script builds Cloudflare Workers, obfuscates them,
-#              checks for forbidden strings, and compresses them into zip files.
+# Description: Builds Cloudflare Workers, obfuscates them with a
+#              per-build ChaCha20 string cipher, verifies that nothing
+#              was lost or broken, and packs them into zip files.
 # Creator: vadash
+# Version: 2.0.0
+#
+# Pipeline (per attempt):
+#   wrangler dry-run  -> uglify (AST-level minify + drop_console)
+#   -> obfuscate.mjs  (js-confuser + ChaCha20 string cipher)
+#   -> verify.mjs     (data-loss / plaintext-leak / syntax gate)
+#   -> smoke.mjs      (behaviour must equal the pre-obfuscation build)
+#   -> 7z
+#
+# Tuning knobs are environment variables read by obfuscate.mjs:
+#   HARDEN_STRINGS (true) HARDEN_OPAQUE (0.2) HARDEN_CFF (0.05)
+#   HARDEN_INTEGRITY (true) HARDEN_ANTIDEBUG (false) HARDEN_SELFDEFENDING (false)
 # ==================================================================
 
 # Constants
 $howManyToBuild = 20
 $sevenZipPath = "C:\Program Files\7-Zip\7z.exe"
-$sensitiveFileAuto = ".\sensitive_words_auto.txt"
-$sensitiveFileManual = ".\sensitive_words_manual.txt"
 $workerPath = ".\output\_worker.js"
+$referencePath = ".\output\_worker.reference.js"
+$zipDir = ".\output\zips"
+$smokeEveryBuild = $true   # set to $false to only run the behavioural gate once
+$maxRetries = $howManyToBuild * 5
 
 #region Helper Functions
 
@@ -31,102 +46,41 @@ function Ensure-OutputDirectory {
     }
 }
 
+# Runs an external command and turns a non-zero exit code into a PowerShell
+# exception, so the retry loop can react to it. Output is inherited (not piped)
+# so this also works in constrained/CI shells.
+function Invoke-Checked {
+    param(
+        [string]$Command,
+        [string[]]$Arguments,
+        [string]$Label
+    )
+    & $Command @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Label failed with exit code $LASTEXITCODE"
+    }
+}
+
+function Invoke-NodeScript {
+    param([string]$Script)
+    Invoke-Checked -Command "node" -Arguments @($Script) -Label "node $Script"
+}
+
 #endregion
 
 #region Core Functions
 
-function Replace-NameCalls {
-    param([string]$workerPath)
-    $content = Get-Content -Path $workerPath -Raw
-    $nameCalls = [regex]::Matches($content, '__name\(([^,]+),\s*"([^"]+)"\)')
-
-    if ($nameCalls.Count -eq 0) {
-        Write-Status "No __name calls found in '$workerPath'"
-        return
-    }
-
-    $replacements = New-Object System.Collections.Generic.List[object]
-    foreach ($call in $nameCalls) {
-        $randomHexString = -join (Get-Random -Count 4 -InputObject ([char[]]'0123456789abcdef'))
-        $newCall = $call.Value -replace '__name\(([^,]+),\s*"([^"]+)"\)', "__name(`$1, `"$randomHexString`")"
-        $replacements.Add(@{ Original = $call.Value; New = $newCall })
-    }
-
-    $newContent = $content
-    $replacements | ForEach-Object { $newContent = $newContent.Replace($_.Original, $_.New) }
-    Set-Content -Path $workerPath -Value $newContent -Force
-    Write-Status "Replaced $($nameCalls.Count) __name calls in '$workerPath'"
-}
-
-function Remove-ConsoleLogs {
-    param([string]$workerPath)
-    $content = Get-Content -Path $workerPath
-    $filtered = $content | Where-Object { $_ -notmatch 'console\.(log|error|warn|info|debug)' }
-    Set-Content -Path $workerPath -Value $filtered
-    Write-Status "Removed console logs from '$workerPath'"
-}
-
-function Remove-NonAsciiCharacters {
-    param([string]$workerPath)
-    $content = Get-Content -Path $workerPath -Raw
-    # Regex to remove non-ASCII characters and Unicode escape sequences
-    $cleaned = $content -replace '[^\x00-\x7F]|\\u[0-9A-Fa-f]{4}|\\u\{[0-9A-Fa-f]{1,6}\}', ''
-    Set-Content -Path $workerPath -Value $cleaned
-    Write-Status "Removed non-ASCII characters and Unicode escapes from '$workerPath'"
-}
-
-function Normalize-Whitespace {
-    param([string]$workerPath)
-    $content = Get-Content -Path $workerPath -Raw
-
-    $pattern = @"
-    (
-        (?<string>"(?:\\"|[^"])*"|'(?:\\'|[^'])*')   # String literals
-        |
-        (?<regex>/(?:\\/|[^/\r\n])+?/(?:[gmiuy]+)?)  # Regex literals (basic support)
-        |
-        (?<block_comment>/\*.*?\*/)                  # Block comments
-        |
-        (?<line_comment>//[^\r\n]*)                  # Line comments
-        |
-        (?<space>[ \t]+)                             # Horizontal whitespace
-    )
-"@
-
-    $cleaned = [regex]::Replace($content, $pattern, {
-        param($match)
-        if ($match.Groups['space'].Success) {
-            ' '  # Collapse spaces/tabs to single space
-        } else {
-            $match.Value  # Preserve other matched elements
-        }
-    }, [System.Text.RegularExpressions.RegexOptions]::Singleline -bor [System.Text.RegularExpressions.RegexOptions]::IgnorePatternWhitespace)
-
-    # Replace multiple newlines with a single newline
-    $cleaned = $cleaned -replace '[\r\n]+', "`n"
-
-    Set-Content -Path $workerPath -Value $cleaned
-    Write-Host "Normalized whitespace sequences in '$workerPath'"
-}
-
-function Invoke-JsObfuscation {
-    param([string]$workerPath)
-    try {
-        npx uglify-js $workerPath -o $workerPath --compress --mangle -O keep_quoted_props
-        Write-Status "Obfuscated JavaScript using uglify-js"
-    }
-    catch {
-        Write-Status "Failed to obfuscate JavaScript: $_" -Level "ERROR"
-        throw
-    }
-}
-
-function Replace-LetConstWithVar {
-    param([string]$workerPath)
-    $content = Get-Content -Path $workerPath
-    $modified = $content -replace '\b(let|const)\b', 'var'
-    Set-Content -Path $workerPath -Value $modified
-    Write-Status "Replaced let/const with var in '$workerPath'"
+function Invoke-Uglify {
+    param([string]$Path)
+    # AST-level work only: console calls are removed by the compressor and
+    # whitespace by the minifier - no regex is ever run over the source text.
+    Invoke-Checked -Command "node" -Arguments @(
+        "node_modules/uglify-js/bin/uglifyjs", $Path, "-o", $Path,
+        "--compress", "drop_console=true",
+        "--mangle",
+        "-O", "keep_quoted_props"
+    ) -Label "uglify-js" | Out-Null
+    Write-Status "Minified '$Path' with uglify-js (drop_console, mangle)"
 }
 
 #endregion
@@ -135,7 +89,9 @@ function Replace-LetConstWithVar {
 
 function Invoke-WranglerBuild {
     try {
-        npx wrangler deploy --dry-run --outdir output *>&1 | Out-Null
+        Invoke-Checked -Command "node" -Arguments @(
+            "node_modules/wrangler/bin/wrangler.js", "deploy", "--dry-run", "--outdir", "output"
+        ) -Label "wrangler dry-run" | Out-Null
         if (!(Test-Path ".\output\worker.js")) {
             throw "Wrangler build failed - no output file created"
         }
@@ -157,71 +113,17 @@ function Build-Worker {
         Ensure-OutputDirectory
         Invoke-WranglerBuild
         Initialize-WorkerFile
+        Invoke-Uglify -Path $workerPath
 
-        Remove-ConsoleLogs -workerPath $workerPath
-        Replace-NameCalls -workerPath $workerPath
-        Remove-NonAsciiCharacters -workerPath $workerPath
-        Normalize-Whitespace -workerPath $workerPath
-        Invoke-JsObfuscation -workerPath $workerPath
-
-        return Get-Content -Path $workerPath -Raw
+        # The reference is what every obfuscated build is compared against:
+        # same wrangler output, same uglify pass, only js-confuser missing.
+        Copy-Item -Path $workerPath -Destination $referencePath -Force
+        Write-Status "Saved pre-obfuscation reference to '$referencePath'"
     }
     catch {
         Write-Status "Build failed: $_" -Level "ERROR"
         throw
     }
-}
-
-#endregion
-
-#region Security Functions
-
-function Get-ForbiddenStrings {
-    param([string]$filePath)
-    if (!(Test-Path $filePath)) {
-        Write-Status "Critical error: Missing forbidden strings file '$filePath'" -Level "ERROR"
-        exit 1
-    }
-    return Get-Content $filePath | Where-Object { $_ -match '\S' }
-}
-
-function Replace-ForbiddenTerms {
-    param(
-        [string]$workerPath,
-        [array]$terms,
-        [System.Collections.Generic.HashSet[string]]$usedValues
-    )
-    $content = Get-Content -Path $workerPath -Raw
-    $replacements = @{}
-
-    foreach ($term in $terms) {
-        do {
-            $identifier = [char](97..122 | Get-Random) + (-join ((48..57) + (97..102) | Get-Random -Count 3))
-        } while (!$usedValues.Add($identifier))
-
-        $replacements[$term] = $identifier
-        $pattern = "(?i)\b$([regex]::Escape($term))\b"
-        $content = $content -replace $pattern, $identifier
-    }
-
-    Set-Content -Path $workerPath -Value $content
-    Write-Status "Replaced $($terms.Count) forbidden terms in '$workerPath'"
-}
-
-function Test-ForbiddenStrings {
-    param(
-        [string]$workerPath,
-        [array]$forbiddenStrings
-    )
-    $content = Get-Content -Path $workerPath -Raw
-    foreach ($term in $forbiddenStrings) {
-        if ($content -imatch "\b$term\b") {
-            Write-Status "Security violation detected: '$term'" -Level "WARNING"
-            [System.Console]::Beep(800, 500)
-            return $true
-        }
-    }
-    return $false
 }
 
 #endregion
@@ -237,19 +139,25 @@ function Confirm-7ZipAvailable {
 }
 
 function Stop-7ZipProcesses {
-    taskkill /f /im 7zFM.exe 2>&1 | Out-Null
-    Write-Status "Terminated 7-Zip GUI processes"
+    # Only touch taskkill when the GUI is actually running: its stderr would
+    # otherwise be pure noise, and piping native output breaks constrained shells.
+    if (Get-Process -Name 7zFM -ErrorAction SilentlyContinue) {
+        & taskkill /f /im 7zFM.exe
+        Write-Status "Terminated 7-Zip GUI processes"
+    }
 }
 
 function Compress-WorkerFile {
     param(
-        [string]$workerPath,
-        [string]$outputDir
+        [string]$Path,
+        [string]$OutputDir
     )
-    Ensure-OutputDirectory -Path $outputDir
+    Ensure-OutputDirectory -Path $OutputDir
     $zipName = "worker-$(New-Guid).zip"
 
-    & $sevenZipPath a -tzip -mx=0 "$outputDir\$zipName" $workerPath *>&1 | Out-Null
+    Invoke-Checked -Command $sevenZipPath -Arguments @(
+        "a", "-tzip", "-mx=0", "$OutputDir\$zipName", $Path
+    ) -Label "7-Zip" | Out-Null
     Write-Status "Created compressed worker: $zipName"
 }
 
@@ -258,48 +166,43 @@ function Compress-WorkerFile {
 #region Main Execution
 
 try {
-    # Initial setup
-    npm install wrangler --save-dev
     Confirm-7ZipAvailable
     Stop-7ZipProcesses
     Remove-Item -Recurse -Force -Path .\output\ -ErrorAction SilentlyContinue
 
-    # Load security data
-    $autoForbidden = Get-ForbiddenStrings -filePath $sensitiveFileAuto
-    $manualForbidden = Get-ForbiddenStrings -filePath $sensitiveFileManual
+    # Guard the cipher itself before spending time on a build.
+    Invoke-NodeScript "tools/cipher.test.mjs"
 
-    # Initial build
-    $originalContent = Build-Worker
+    Build-Worker
+
     $successCount = 0
     $retryCount = 0
-    $maxRetries = $howManyToBuild * 5  # Prevent infinite loops
 
     while ($successCount -lt $howManyToBuild -and $retryCount -lt $maxRetries) {
         try {
             $retryCount++
-            Set-Content -Path $workerPath -Value $originalContent
-            $usedIdentifiers = [System.Collections.Generic.HashSet[string]]::new()
+            Write-Status "Build attempt $retryCount (successful so far: $successCount/$howManyToBuild)"
 
-            Replace-ForbiddenTerms -workerPath $workerPath -terms $manualForbidden -usedValues $usedIdentifiers
-            node .\obfuscate.mjs *>&1 | Out-Null
-
-            if (Test-ForbiddenStrings -workerPath $workerPath -forbiddenStrings $autoForbidden) {
-                continue
+            Copy-Item -Path $referencePath -Destination $workerPath -Force
+            Invoke-NodeScript "obfuscate.mjs"
+            Invoke-NodeScript "verify.mjs"
+            if ($smokeEveryBuild -or $successCount -eq 0) {
+                Invoke-NodeScript "smoke.mjs"
             }
 
-            Replace-LetConstWithVar -workerPath $workerPath
-            Compress-WorkerFile -workerPath $workerPath -outputDir ".\output\zips"
+            Compress-WorkerFile -Path $workerPath -OutputDir $zipDir
 
             $successCount++
             Write-Status "Successfully created worker $successCount/$howManyToBuild" -Level "SUCCESS"
         }
         catch {
-            Write-Status "Build attempt $retryCount failed: $_" -Level "WARNING"
+            Write-Status "Build attempt $retryCount rejected: $_" -Level "WARNING"
         }
     }
 
-    # Cleanup and final report
+    # Keep only the zips
     Get-ChildItem -Path .\output\ -Exclude zips | Remove-Item -Recurse -Force
+
     if ($successCount -eq $howManyToBuild) {
         Write-Status "Build process completed successfully" -Level "SUCCESS"
     }
@@ -309,6 +212,7 @@ try {
 }
 catch {
     Write-Status "Critical error in main execution: $_" -Level "ERROR"
+    pause
     exit 1
 }
 
