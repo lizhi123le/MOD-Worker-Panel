@@ -57,37 +57,54 @@ function Ensure-OutputDirectory {
     }
 }
 
-# Fails fast with an actionable message when the repository has never been
-# installed (or node_modules was cleaned). Without this the very first wrangler
-# call dies with a bare "Cannot find module ...\node_modules\wrangler\bin\
-# wrangler.js", which is what makes the script look like it simply quits.
+# Guarantees the dependencies the pipeline calls into. When node_modules is
+# absent or incomplete (a fresh clone, or someone cleaned it deliberately) the
+# very first wrangler call used to die with a bare "Cannot find module
+# ...\node_modules\wrangler\bin\wrangler.js", which is what makes the script look
+# like it simply quits. Install them instead of only complaining about them.
 function Assert-Prerequisites {
-    $missing = @()
+    $required = @(
+        'node_modules/wrangler/bin/wrangler.js',
+        'node_modules/uglify-js/bin/uglifyjs',
+        'node_modules/js-confuser',
+        'node_modules/@babel/parser'
+    )
+
+    $missing = @($required | Where-Object { !(Test-Path -LiteralPath $_) })
+    if ($missing.Count -eq 0) { return }
 
     if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
-        $missing += 'node - Node.js is not on PATH'
+        throw "node is not on PATH - install Node.js, then start this script again."
     }
-
-    foreach ($relative in @(
-            'node_modules/wrangler/bin/wrangler.js',
-            'node_modules/uglify-js/bin/uglifyjs',
-            'node_modules/js-confuser',
-            'node_modules/@babel/parser')) {
-        if (!(Test-Path -LiteralPath $relative)) { $missing += $relative }
-    }
-
-    if ($missing.Count -gt 0) {
+    if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
         throw ("build prerequisites are missing:`n      " + ($missing -join "`n      ") +
-            "`n    Run 'npm install' in $PWD, then start this script again.")
+            "`n    npm is not on PATH either, so they have to be installed by hand.")
     }
+
+    Write-Status "node_modules is incomplete (missing $($missing.Count) path(s)) - running 'npm install'..."
+    & npm install --no-audit --no-fund
+    if ($LASTEXITCODE -ne 0) {
+        throw "npm install failed with exit code $LASTEXITCODE - fix the output above, then start this script again."
+    }
+
+    $stillMissing = @($required | Where-Object { !(Test-Path -LiteralPath $_) })
+    if ($stillMissing.Count -gt 0) {
+        throw ("'npm install' finished but these are still missing:`n      " +
+            ($stillMissing -join "`n      "))
+    }
+    Write-Status "Dependencies restored" -Level "SUCCESS"
 }
 
 # Keeps a failure on screen. `pause` returns immediately when stdin is not an
 # interactive console (npm run, a pipe, a redirected shell, DSH), which is how a
 # failed build could disappear before the error could be read.
+#
+# ASCII only, deliberately: this file is UTF-8 without a BOM, and Windows
+# PowerShell 5.1 (which is what `npm run build` invokes) reads a BOM-less file
+# as ANSI/GBK, so any non-ASCII byte here comes out as mojibake.
 function Wait-BeforeExit {
     try {
-        $null = Read-Host '按 Enter 键退出...'
+        $null = Read-Host 'Press Enter to exit...'
     }
     catch {
         Start-Sleep -Seconds 10
@@ -202,7 +219,12 @@ function Compress-WorkerFile {
         [string]$OutputDir
     )
     Ensure-OutputDirectory -Path $OutputDir
-    $zipName = "worker-$(New-Guid).zip"
+    # [guid]::NewGuid(), not the New-Guid cmdlet. `npm run build` launches
+    # Windows PowerShell 5.1 from whatever shell you are in; a PowerShell 7
+    # parent hands its own PSModulePath down, 5.1 then fails to resolve
+    # New-Guid, and every build attempt was rejected with "The term 'New-Guid'
+    # is not recognized". A .NET call has no such dependency.
+    $zipName = "worker-$([guid]::NewGuid().ToString()).zip"
 
     Invoke-Checked -Command $sevenZipPath -Arguments @(
         "a", "-tzip", "-mx=0", "$OutputDir\$zipName", $Path
@@ -260,7 +282,10 @@ try {
         Write-Status "Build process completed successfully" -Level "SUCCESS"
     }
     else {
-        Write-Status "Build process completed with only $successCount/$howManyToBuild successful builds" -Level "WARNING"
+        # Throw, do not just warn: the retry loop swallows each attempt, so
+        # without this the script printed "only 0/20 successful builds" and
+        # still exited 0, which made `npm run build` look like a success.
+        throw "only $successCount/$howManyToBuild builds succeeded after $retryCount attempt(s)"
     }
 }
 catch {
